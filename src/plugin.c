@@ -25,6 +25,13 @@ static void (*l_DebugCallback)(void *, int, const char *) = NULL;
 static void *l_DebugCallContext = NULL;
 static int l_PluginInit = 0;
 
+static m64p_handle g_config;
+
+ptr_ConfigOpenSection      ConfigOpenSection = NULL;
+ptr_ConfigSaveSection      ConfigSaveSection = NULL;
+ptr_ConfigSetDefaultString ConfigSetDefaultString = NULL;
+ptr_ConfigGetParamString   ConfigGetParamString = NULL;
+
 /* Global functions */
 void DebugMessage(int level, const char *message, ...)
 {
@@ -51,6 +58,29 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle CoreLibHandle, void *Con
 	/* first thing is to set the callback function for debug info */
 	l_DebugCallback = DebugCallback;
 	l_DebugCallContext = Context;
+
+	DebugMessage(M64MSG_ERROR, "Loading pointers..");
+
+	ConfigOpenSection = (ptr_ConfigOpenSection) DLSYM(CoreLibHandle, "ConfigOpenSection");
+	ConfigSaveSection = (ptr_ConfigSaveSection) DLSYM(CoreLibHandle, "ConfigSaveSection");
+	ConfigSetDefaultString = (ptr_ConfigSetDefaultString) DLSYM(CoreLibHandle, "ConfigSetDefaultString");
+	ConfigGetParamString = (ptr_ConfigGetParamString) DLSYM(CoreLibHandle, "ConfigGetParamString");
+
+	DebugMessage(M64MSG_ERROR, "Loaded pointers..");
+
+	if (!ConfigOpenSection || !ConfigSaveSection || !ConfigSetDefaultString)
+		return M64ERR_INCOMPATIBLE;
+
+	if (ConfigOpenSection("input-lua", &g_config) != M64ERR_SUCCESS)
+	{
+		DebugMessage(M64MSG_ERROR, "Couldn't open config section 'input-lua'");
+		return M64ERR_INPUT_NOT_FOUND;
+	}
+
+	ConfigSetDefaultString(g_config, "LuaScript", "~/mupen.lua", "Path for the Lua script to be ran");
+	ConfigSaveSection("input-lua");
+
+	DebugMessage(M64MSG_ERROR, "Saved config");
 
 	L = luaL_newstate();
 
@@ -172,16 +202,6 @@ EXPORT void CALL ControllerCommand(int Control, unsigned char *Command)
 	note:     This function is only needed if the DLL is allowing raw
 						data.
 *******************************************************************/
-
-void print_hex_memory(const char *mem, size_t len) {
-  int i;
-  unsigned char *p = (unsigned char *)mem;
-  for (i=0;i<len;i++) {
-    printf("0x%02x ", p[i]);
-  }
-  printf("\n");
-}
-
 EXPORT void CALL ReadController(int Control, unsigned char *Command)
 {
 	if (Command == NULL || Control != 0)
@@ -221,7 +241,9 @@ EXPORT void CALL ReadController(int Control, unsigned char *Command)
 *******************************************************************/
 EXPORT int CALL RomOpen(void)
 {
-	int status = luaL_loadfile(L, "/home/jake/Developer/n64lua/mupen.lua");
+	const char* lua_file = ConfigGetParamString(g_config, "LuaScript");
+
+	int status = luaL_loadfile(L, lua_file);
 
 	if (status != 0) {
 		fprintf(stderr, "lua error: %s\n", lua_tostring(L, -1));
