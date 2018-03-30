@@ -19,9 +19,6 @@ typedef struct
     BUTTONS buttons;  // pointer to BUTTONS struct in Core library
 } SController;
 
-/* global data definitions */
-extern SController controller[1]; // 1 controller
-
 /* global function definitions */
 extern void DebugMessage(int level, const char *message, ...);
 

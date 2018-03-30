@@ -18,14 +18,14 @@ lua_State *L;
 int lua_input_ref;
 
 /* global data definitions */
-SController controller[1];  // 1 controller
+SController controller[4];  // 4 controllers
 
 /* static data definitions */
 static void (*l_DebugCallback)(void *, int, const char *) = NULL;
 static void *l_DebugCallContext = NULL;
 static int l_PluginInit = 0;
 
-static m64p_handle g_config;
+static m64p_handle l_ConfigInput;
 
 ptr_ConfigOpenSection      ConfigOpenSection = NULL;
 ptr_ConfigSaveSection      ConfigSaveSection = NULL;
@@ -52,6 +52,8 @@ void DebugMessage(int level, const char *message, ...)
 /* Mupen64Plus plugin functions */
 EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle CoreLibHandle, void *Context, void (*DebugCallback)(void *, int, const char *))
 {
+	ptr_CoreGetAPIVersions CoreAPIVersionFunc;
+
 	if (l_PluginInit)
 		return M64ERR_ALREADY_INIT;
 
@@ -59,32 +61,55 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle CoreLibHandle, void *Con
 	l_DebugCallback = DebugCallback;
 	l_DebugCallContext = Context;
 
-	DebugMessage(M64MSG_ERROR, "Loading pointers..");
+	/* attach and call the CoreGetAPIVersions function, check Config API version for compatibility */
+	CoreAPIVersionFunc = (ptr_CoreGetAPIVersions) DLSYM(CoreLibHandle, "CoreGetAPIVersions");
+	if (CoreAPIVersionFunc == NULL)
+	{
+		DebugMessage(M64MSG_ERROR, "Core emulator broken; no CoreAPIVersionFunc() function found.");
+		return M64ERR_INCOMPATIBLE;
+	}
+
+	int ConfigAPIVersion, DebugAPIVersion, VidextAPIVersion;
+	
+	(*CoreAPIVersionFunc)(&ConfigAPIVersion, &DebugAPIVersion, &VidextAPIVersion, NULL);
+	if ((ConfigAPIVersion & 0xffff0000) != (CONFIG_API_VERSION & 0xffff0000) || ConfigAPIVersion < CONFIG_API_VERSION)
+	{
+		DebugMessage(M64MSG_ERROR, "Emulator core Config API (v%i.%i.%i) incompatible with plugin (v%i.%i.%i)",
+				VERSION_PRINTF_SPLIT(ConfigAPIVersion), VERSION_PRINTF_SPLIT(CONFIG_API_VERSION));
+		return M64ERR_INCOMPATIBLE;
+	}
 
 	ConfigOpenSection = (ptr_ConfigOpenSection) DLSYM(CoreLibHandle, "ConfigOpenSection");
 	ConfigSaveSection = (ptr_ConfigSaveSection) DLSYM(CoreLibHandle, "ConfigSaveSection");
 	ConfigSetDefaultString = (ptr_ConfigSetDefaultString) DLSYM(CoreLibHandle, "ConfigSetDefaultString");
 	ConfigGetParamString = (ptr_ConfigGetParamString) DLSYM(CoreLibHandle, "ConfigGetParamString");
 
-	DebugMessage(M64MSG_ERROR, "Loaded pointers..");
-
-	if (!ConfigOpenSection || !ConfigSaveSection || !ConfigSetDefaultString)
+	if (!ConfigOpenSection || !ConfigSaveSection || !ConfigSetDefaultString || !ConfigGetParamString)
 		return M64ERR_INCOMPATIBLE;
 
-	if (ConfigOpenSection("input-lua", &g_config) != M64ERR_SUCCESS)
+	if (ConfigOpenSection("Input-Lua", &l_ConfigInput) != M64ERR_SUCCESS)
 	{
 		DebugMessage(M64MSG_ERROR, "Couldn't open config section 'input-lua'");
 		return M64ERR_INPUT_NOT_FOUND;
 	}
 
-	ConfigSetDefaultString(g_config, "LuaScript", "~/mupen.lua", "Path for the Lua script to be ran");
-	ConfigSaveSection("input-lua");
-
-	DebugMessage(M64MSG_ERROR, "Saved config");
+	ConfigSetDefaultString(l_ConfigInput, "LuaScript", "~/mupen.lua", "Path for the Lua script to be ran");
+	ConfigSaveSection("Input-Lua");
 
 	L = luaL_newstate();
 
 	luaL_openlibs(L);
+
+	lua_pushinteger(L, PLUGIN_NONE);
+	lua_setglobal(L, "PLUGIN_NONE");
+	lua_pushinteger(L, PLUGIN_MEMPAK);
+	lua_setglobal(L, "PLUGIN_MEMPAK");
+	lua_pushinteger(L, PLUGIN_RUMBLE_PAK);
+	lua_setglobal(L, "PLUGIN_RUMBLE_PAK");
+	lua_pushinteger(L, PLUGIN_TRANSFER_PAK);
+	lua_setglobal(L, "PLUGIN_TRANSFER_PAK");
+	lua_pushinteger(L, PLUGIN_RAW);
+	lua_setglobal(L, "PLUGIN_RAW");
 
 	l_PluginInit = 1;
 	return M64ERR_SUCCESS;
@@ -133,17 +158,58 @@ EXPORT m64p_error CALL PluginGetVersion(m64p_plugin_type *PluginType, int *Plugi
 *******************************************************************/
 EXPORT void CALL InitiateControllers(CONTROL_INFO ControlInfo)
 {
+	const char* lua_file = ConfigGetParamString(l_ConfigInput, "LuaScript");
+
+	int status = luaL_loadfile(L, lua_file);
+
+	if (status != 0) {
+		DebugMessage(M64MSG_ERROR, "lua error: %s", lua_tostring(L, -1));
+		return;
+	}
+
+	int ret = lua_pcall(L, 0, 1, 0);
+	if (ret != 0) {
+		DebugMessage(M64MSG_ERROR, "lua runtime error: %s", lua_tostring(L, -1));
+		return;
+	}
+
+	lua_input_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
 	// reset controllers
 	memset(controller, 0, sizeof(SController));
 
-	// set our CONTROL struct pointers to the array that was passed in to this function from the core
-	// this small struct tells the core whether each controller is plugged in, and what type of pak is connected
-	controller[0].control = ControlInfo.Controls;
+	for (int i=0; i<4; i++) {
+		// set our CONTROL struct pointers to the array that was passed in to this function from the core
+		// this small struct tells the core whether each controller is plugged in, and what type of pak is connected
+		controller[i].control = ControlInfo.Controls;
 
-	// init controller
-	controller[0].control->Present = 1;
-	controller[0].control->RawData = 1;
-	//controller[0].control->Plugin = PLUGIN_RAW;
+		lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
+			lua_getfield(L, -1, "InitiateController");
+		lua_remove(L, -2); // Pop input table
+
+		lua_pushinteger(L, i+1);
+
+		int ret = lua_pcall(L, 1, 1, 0);
+		if (ret != 0) {
+			DebugMessage(M64MSG_ERROR, "lua runtime error: %s", lua_tostring(L, -1));
+			return;
+		}
+
+		if (lua_istable(L, -1)) {
+			// init controller
+			lua_getfield(L, -1, "Present");
+			controller[i].control->Present = lua_toboolean(L, -1);
+			lua_pop(L, 1);
+			lua_getfield(L, -1, "RawData");
+			controller[i].control->RawData = lua_toboolean(L, -1);
+			lua_pop(L, 1);
+			lua_getfield(L, -1, "Plugin");
+			controller[i].control->Plugin = lua_tointeger(L, -1);
+			lua_pop(L, 1);
+		}
+
+		lua_pop(L, 1); // Pop return value
+	}
 
 	DebugMessage(M64MSG_INFO, "%s version %i.%i.%i initialized.", PLUGIN_NAME, VERSION_PRINTF_SPLIT(PLUGIN_VERSION));
 }
@@ -166,7 +232,7 @@ EXPORT void CALL InitiateControllers(CONTROL_INFO ControlInfo)
 *******************************************************************/
 EXPORT void CALL ControllerCommand(int Control, unsigned char *Command)
 {
-	if (Command == NULL || Control != 0)
+	if (Command == NULL)
 		return;
 
 	unsigned char tx_len = Command[0] & 0x3F;
@@ -176,19 +242,19 @@ EXPORT void CALL ControllerCommand(int Control, unsigned char *Command)
 	unsigned char *rx_data = Command + 2 + tx_len;
 
 	lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
-	lua_getfield(L, -1, "ControllerCommand");
+		lua_getfield(L, -1, "ControllerCommand");
+	lua_remove(L, -2); // Pop input table
 
+	lua_pushinteger(L, Control + 1);
 	lua_pushinteger(L, tx_len);
 	lua_pushinteger(L, rx_len);
 	lua_pushlstring(L, (char*) tx_data, tx_len);
 	lua_pushlstring(L, (char*) rx_data, rx_len);
 
-	int ret = lua_pcall(L, 4, 0, 0);
+	int ret = lua_pcall(L, 5, 0, 0);
 	if (ret != 0) {
-		fprintf(stderr, "lua runtime error: %s\n", lua_tostring(L, -1));
+		DebugMessage(M64MSG_ERROR, "lua runtime error: %s", lua_tostring(L, -1));
 	}
-
-	lua_pop(L, 1);
 }
 
 /******************************************************************
@@ -204,7 +270,7 @@ EXPORT void CALL ControllerCommand(int Control, unsigned char *Command)
 *******************************************************************/
 EXPORT void CALL ReadController(int Control, unsigned char *Command)
 {
-	if (Command == NULL || Control != 0)
+	if (Command == NULL)
 		return;
 
 	unsigned char tx_len = Command[0] & 0x3F;
@@ -214,22 +280,26 @@ EXPORT void CALL ReadController(int Control, unsigned char *Command)
 	unsigned char *rx_data = Command + 2 + tx_len;
 
 	lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
-	lua_getfield(L, -1, "ReadController");
+		lua_getfield(L, -1, "ReadController");
+	lua_remove(L, -2); // Pop input table
 
+	lua_pushinteger(L, Control + 1);
 	lua_pushinteger(L, tx_len);
 	lua_pushinteger(L, rx_len);
 	lua_pushlstring(L, (char*) tx_data, tx_len);
 	lua_pushlstring(L, (char*) rx_data, rx_len);
 
-	int ret = lua_pcall(L, 4, 1, 0);
+	int ret = lua_pcall(L, 5, 1, 0);
 	if (ret != 0) {
-		fprintf(stderr, "lua runtime error: %s\n", lua_tostring(L, -1));
+		DebugMessage(M64MSG_ERROR, "lua runtime error: %s", lua_tostring(L, -1));
 	}
 
-	const char* data = lua_tostring(L, -1);
-	memcpy(rx_data, data, rx_len);
+	if (lua_isstring(L, -1)) {
+		const char* data = lua_tostring(L, -1);
+		memcpy(rx_data, data, rx_len);
+	}
 
-	lua_pop(L, 2);
+	lua_pop(L, 1); // Pop return value
 }
 
 /******************************************************************
@@ -241,23 +311,6 @@ EXPORT void CALL ReadController(int Control, unsigned char *Command)
 *******************************************************************/
 EXPORT int CALL RomOpen(void)
 {
-	const char* lua_file = ConfigGetParamString(g_config, "LuaScript");
-
-	int status = luaL_loadfile(L, lua_file);
-
-	if (status != 0) {
-		fprintf(stderr, "lua error: %s\n", lua_tostring(L, -1));
-		return 0;
-	}
-
-	int ret = lua_pcall(L, 0, 1, 0);
-	if (ret != 0) {
-		fprintf(stderr, "lua runtime error: %s\n", lua_tostring(L, -1));
-		return 0;
-	}
-
-	lua_input_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-
 	return 1;
 }
 
@@ -282,23 +335,23 @@ EXPORT void CALL RomClosed(void)
 *******************************************************************/
 EXPORT void CALL GetKeys(int Control, BUTTONS *Keys )
 {
-	if (Control != 0)
-		return;
-
 	lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
-	lua_getfield(L, -1, "GetKeys");
+		lua_getfield(L, -1, "GetKeys");
+	lua_remove(L, -2); // Pop input table
 
-	int ret = lua_pcall(L, 0, 1, 0);
+	lua_pushinteger(L, Control + 1);
+
+	int ret = lua_pcall(L, 1, 1, 0);
 	if (ret != 0) {
-		fprintf(stderr, "lua runtime error: %s\n", lua_tostring(L, -1));
+		DebugMessage(M64MSG_ERROR, "lua runtime error: %s", lua_tostring(L, -1));
 	}
 
 	int keys = lua_tointeger(L, -1);
 
-	lua_pop(L, 2);
+	lua_pop(L, 1); // Pop return value
 
-	memcpy(&controller[0].buttons, &keys, sizeof keys);
-	*Keys = controller[0].buttons;
+	memcpy(&controller[Control].buttons, &keys, sizeof keys);
+	*Keys = controller[Control].buttons;
 }
 
 /******************************************************************
