@@ -32,6 +32,21 @@ ptr_ConfigSaveSection      ConfigSaveSection = NULL;
 ptr_ConfigSetDefaultString ConfigSetDefaultString = NULL;
 ptr_ConfigGetParamString   ConfigGetParamString = NULL;
 
+static int check_err(int status)
+{
+	if (status != 0) {
+		DebugMessage(M64MSG_ERROR, "lua error: %s", lua_tostring(L, -1));
+		lua_pop(L, 1);
+	}
+	return status;
+}
+
+static int traceback(lua_State *l)
+{
+	luaL_traceback(l, l, lua_tostring(l, 1), 1);
+	return 1;
+}
+
 /* Global functions */
 void DebugMessage(int level, const char *message, ...)
 {
@@ -160,56 +175,50 @@ EXPORT void CALL InitiateControllers(CONTROL_INFO ControlInfo)
 {
 	const char* lua_file = ConfigGetParamString(l_ConfigInput, "LuaScript");
 
-	int status = luaL_loadfile(L, lua_file);
-
-	if (status != 0) {
-		DebugMessage(M64MSG_ERROR, "lua error: %s", lua_tostring(L, -1));
+	if (check_err(luaL_loadfile(L, lua_file)) != 0)
 		return;
+
+	int base = lua_gettop(L);
+	lua_pushcfunction(L, traceback);
+	lua_insert(L, base);
+
+	if (check_err(lua_pcall(L, 0, 1, base)) == 0) {
+		lua_input_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+		// reset controllers
+		memset(controller, 0, sizeof(SController));
+
+		for (int i=0; i<4; i++) {
+			// set our CONTROL struct pointers to the array that was passed in to this function from the core
+			// this small struct tells the core whether each controller is plugged in, and what type of pak is connected
+			controller[i].control = ControlInfo.Controls;
+
+			lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
+				lua_getfield(L, -1, "InitiateController");
+			lua_remove(L, -2); // Pop input table
+
+			lua_pushinteger(L, i+1);
+
+			if (check_err(lua_pcall(L, 1, 1, base)) == 0) {
+				if (lua_istable(L, -1)) {
+					// init controller
+					lua_getfield(L, -1, "Present");
+					controller[i].control->Present = lua_toboolean(L, -1);
+					lua_pop(L, 1);
+					lua_getfield(L, -1, "RawData");
+					controller[i].control->RawData = lua_toboolean(L, -1);
+					lua_pop(L, 1);
+					lua_getfield(L, -1, "Plugin");
+					controller[i].control->Plugin = lua_tointeger(L, -1);
+					lua_pop(L, 1);
+				}
+
+				lua_pop(L, 1); // Pop return value
+			}
+		}		
 	}
 
-	int ret = lua_pcall(L, 0, 1, 0);
-	if (ret != 0) {
-		DebugMessage(M64MSG_ERROR, "lua runtime error: %s", lua_tostring(L, -1));
-		return;
-	}
-
-	lua_input_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-
-	// reset controllers
-	memset(controller, 0, sizeof(SController));
-
-	for (int i=0; i<4; i++) {
-		// set our CONTROL struct pointers to the array that was passed in to this function from the core
-		// this small struct tells the core whether each controller is plugged in, and what type of pak is connected
-		controller[i].control = ControlInfo.Controls;
-
-		lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
-			lua_getfield(L, -1, "InitiateController");
-		lua_remove(L, -2); // Pop input table
-
-		lua_pushinteger(L, i+1);
-
-		int ret = lua_pcall(L, 1, 1, 0);
-		if (ret != 0) {
-			DebugMessage(M64MSG_ERROR, "lua runtime error: %s", lua_tostring(L, -1));
-			return;
-		}
-
-		if (lua_istable(L, -1)) {
-			// init controller
-			lua_getfield(L, -1, "Present");
-			controller[i].control->Present = lua_toboolean(L, -1);
-			lua_pop(L, 1);
-			lua_getfield(L, -1, "RawData");
-			controller[i].control->RawData = lua_toboolean(L, -1);
-			lua_pop(L, 1);
-			lua_getfield(L, -1, "Plugin");
-			controller[i].control->Plugin = lua_tointeger(L, -1);
-			lua_pop(L, 1);
-		}
-
-		lua_pop(L, 1); // Pop return value
-	}
+	lua_remove(L, base);
 
 	DebugMessage(M64MSG_INFO, "%s version %i.%i.%i initialized.", PLUGIN_NAME, VERSION_PRINTF_SPLIT(PLUGIN_VERSION));
 }
@@ -241,6 +250,9 @@ EXPORT void CALL ControllerCommand(int Control, unsigned char *Command)
 	unsigned char *tx_data = Command + 2;
 	unsigned char *rx_data = Command + 2 + tx_len;
 
+	lua_pushcfunction(L, traceback);
+	int base = lua_gettop(L);
+
 	lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
 		lua_getfield(L, -1, "ControllerCommand");
 	lua_remove(L, -2); // Pop input table
@@ -251,10 +263,9 @@ EXPORT void CALL ControllerCommand(int Control, unsigned char *Command)
 	lua_pushlstring(L, (char*) tx_data, tx_len);
 	lua_pushlstring(L, (char*) rx_data, rx_len);
 
-	int ret = lua_pcall(L, 5, 0, 0);
-	if (ret != 0) {
-		DebugMessage(M64MSG_ERROR, "lua runtime error: %s", lua_tostring(L, -1));
-	}
+	check_err(lua_pcall(L, 5, 0, base));
+
+	lua_remove(L, base);
 }
 
 /******************************************************************
@@ -279,6 +290,9 @@ EXPORT void CALL ReadController(int Control, unsigned char *Command)
 	unsigned char *tx_data = Command + 2;
 	unsigned char *rx_data = Command + 2 + tx_len;
 
+	lua_pushcfunction(L, traceback);
+	int base = lua_gettop(L);
+
 	lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
 		lua_getfield(L, -1, "ReadController");
 	lua_remove(L, -2); // Pop input table
@@ -289,17 +303,15 @@ EXPORT void CALL ReadController(int Control, unsigned char *Command)
 	lua_pushlstring(L, (char*) tx_data, tx_len);
 	lua_pushlstring(L, (char*) rx_data, rx_len);
 
-	int ret = lua_pcall(L, 5, 1, 0);
-	if (ret != 0) {
-		DebugMessage(M64MSG_ERROR, "lua runtime error: %s", lua_tostring(L, -1));
+	if (check_err(lua_pcall(L, 5, 1, base)) == 0) {
+		if (lua_isstring(L, -1)) {
+			const char* data = lua_tostring(L, -1);
+			memcpy(rx_data, data, rx_len);
+		}
+		lua_pop(L, 1); // Pop return value
 	}
 
-	if (lua_isstring(L, -1)) {
-		const char* data = lua_tostring(L, -1);
-		memcpy(rx_data, data, rx_len);
-	}
-
-	lua_pop(L, 1); // Pop return value
+	lua_remove(L, base);
 }
 
 /******************************************************************
@@ -311,6 +323,15 @@ EXPORT void CALL ReadController(int Control, unsigned char *Command)
 *******************************************************************/
 EXPORT int CALL RomOpen(void)
 {
+	lua_pushcfunction(L, traceback);
+	int base = lua_gettop(L);
+
+	lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
+		lua_getfield(L, -1, "RomOpen");
+	lua_remove(L, -2); // Pop input table
+
+	lua_pcall(L, 0, 0, base);
+	lua_remove(L, base);
 	return 1;
 }
 
@@ -322,6 +343,16 @@ EXPORT int CALL RomOpen(void)
 *******************************************************************/
 EXPORT void CALL RomClosed(void)
 {
+	lua_pushcfunction(L, traceback);
+	int base = lua_gettop(L);
+
+	lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
+		lua_getfield(L, -1, "RomClosed");
+	lua_remove(L, -2); // Pop input table
+
+	lua_pcall(L, 0, 0, base);
+	lua_remove(L, base);
+
 	luaL_unref(L, LUA_REGISTRYINDEX, lua_input_ref);
 }
 
@@ -335,23 +366,25 @@ EXPORT void CALL RomClosed(void)
 *******************************************************************/
 EXPORT void CALL GetKeys(int Control, BUTTONS *Keys )
 {
+	lua_pushcfunction(L, traceback);
+	int base = lua_gettop(L);
+
 	lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
 		lua_getfield(L, -1, "GetKeys");
 	lua_remove(L, -2); // Pop input table
 
 	lua_pushinteger(L, Control + 1);
 
-	int ret = lua_pcall(L, 1, 1, 0);
-	if (ret != 0) {
-		DebugMessage(M64MSG_ERROR, "lua runtime error: %s", lua_tostring(L, -1));
+	if (check_err(lua_pcall(L, 1, 1, base)) == 0) {
+		int keys = lua_tointeger(L, -1);
+		lua_pop(L, 1); // Pop return value
+
+		// Set pressed keys within emulator
+		memcpy(&controller[Control].buttons, &keys, sizeof keys);
+		*Keys = controller[Control].buttons;
 	}
 
-	int keys = lua_tointeger(L, -1);
-
-	lua_pop(L, 1); // Pop return value
-
-	memcpy(&controller[Control].buttons, &keys, sizeof keys);
-	*Keys = controller[Control].buttons;
+	lua_remove(L, base);
 }
 
 /******************************************************************
@@ -363,6 +396,19 @@ EXPORT void CALL GetKeys(int Control, BUTTONS *Keys )
 *******************************************************************/
 EXPORT void CALL SDL_KeyDown(int keymod, int keysym)
 {
+	lua_pushcfunction(L, traceback);
+	int base = lua_gettop(L);
+
+	lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
+		lua_getfield(L, -1, "SDLKeyDown");
+	lua_remove(L, -2); // Pop input table
+
+	lua_pushinteger(L, keymod);
+	lua_pushinteger(L, keysym);
+
+	check_err(lua_pcall(L, 2, 0, base));
+
+	lua_remove(L, base);
 }
 
 /******************************************************************
@@ -374,4 +420,17 @@ EXPORT void CALL SDL_KeyDown(int keymod, int keysym)
 *******************************************************************/
 EXPORT void CALL SDL_KeyUp(int keymod, int keysym)
 {
+	lua_pushcfunction(L, traceback);
+	int base = lua_gettop(L);
+
+	lua_rawgeti(L, LUA_REGISTRYINDEX, lua_input_ref);
+		lua_getfield(L, -1, "SDLKeyUp");
+	lua_remove(L, -2); // Pop input table
+
+	lua_pushinteger(L, keymod);
+	lua_pushinteger(L, keysym);
+
+	check_err(lua_pcall(L, 2, 0, base));
+
+	lua_remove(L, base);
 }
